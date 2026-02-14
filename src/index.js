@@ -352,16 +352,17 @@ async function scanOnce() {
     const ticker = t.trim().toUpperCase();
     if (!ticker) continue;
 
- try {
-  bucket.push(...await scanTicker(ticker));
-} catch (e) {
-  console.log(`Scan error for ${ticker}:`, e);
-  console.log("Cause:", e?.cause);
-}
-await sleep(650);
+    try {
+      bucket.push(...await scanTicker(ticker));
+    } catch (e) {
+      console.log(`Scan error for ${ticker}:`, e);
+      console.log("Cause:", e?.cause);
+    }
 
+    await sleep(650);
+  } // <- WICHTIG: for-loop schließen
 
-  bucket.sort((a,b) => (b.rating - a.rating) || (a.approxCost - b.approxCost));
+  bucket.sort((a, b) => (b.rating - a.rating) || (a.approxCost - b.approxCost));
 
   try {
     const posted = await postAlerts(bucket);
@@ -369,16 +370,4 @@ await sleep(650);
   } catch (e) {
     console.log("Fatal scan error:", e?.message || e);
   }
-}
-
-client.once("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  loadCache();
-
-  await scanOnce();
-
-  const ms = Math.max(1, cfg.scanIntervalMinutes) * 60 * 1000;
-  setInterval(scanOnce, ms);
-});
-
-client.login(cfg.token);
+} // <- scanOnce schließen
