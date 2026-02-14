@@ -1,0 +1,18 @@
+{
+  "name": "stonk-bot-final",
+  "version": "1.2.0",
+  "description": "Automated options scanner that posts Discord alerts (calls/puts) using Yahoo Finance options data.",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "yahoo-finance2": "^3.13.0"
+  }
+}
