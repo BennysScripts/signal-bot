@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 
 dotenv.config();
+console.log("Node version:", process.version);
 
 function createYahooClient(mod) {
   const YahooFinance = mod?.default ?? mod;
