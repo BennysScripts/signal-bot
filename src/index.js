@@ -352,13 +352,13 @@ async function scanOnce() {
     const ticker = t.trim().toUpperCase();
     if (!ticker) continue;
 
-    try {
-      bucket.push(...await scanTicker(ticker));
-    } catch (e) {
-      console.log(`Scan error for ${ticker}:`, e?.message || e);
-    }
-    await sleep(650);
-  }
+   try {
+  bucket.push(...await scanTicker(ticker));
+} catch (e) {
+  console.log(`Scan error for ${ticker}:`, e);
+  console.log("Cause:", e?.cause);
+}
+await sleep(650);
 
   bucket.sort((a,b) => (b.rating - a.rating) || (a.approxCost - b.approxCost));
 
