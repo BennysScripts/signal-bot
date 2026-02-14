@@ -44,10 +44,13 @@ const cfg = {
 
   useEmbeds: (process.env.USE_EMBEDS ?? "true").toLowerCase() === "true",
 
+  stopLossEnabled: (process.env.STOP_LOSS_ENABLED ?? "false").toLowerCase() === "true",
+  stopLossPct: Number(process.env.STOP_LOSS_PCT || 25),
+
   includeCalls: (process.env.INCLUDE_CALLS ?? "true").toLowerCase() === "true",
   includePuts: (process.env.INCLUDE_PUTS ?? "true").toLowerCase() === "true",
 
-  useTrendFilter: (process.env.USE_TREND_FILTER ?? "true").toLowerCase() === "true",
+  useTrendFilter: (process.env.USE_TREND_FILTER ?? "false").toLowerCase() === "true",
 
   dteMin: Number(process.env.DTE_MIN || 3),
   dteMax: Number(process.env.DTE_MAX || 21),
@@ -72,6 +75,8 @@ const cfg = {
   tagVipRole: (process.env.TAG_VIP_ROLE ?? "false").toLowerCase() === "true",
 };
 
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+
 if (!cfg.token || !cfg.channelId) {
   console.error("Missing DISCORD_TOKEN or CHANNEL_ID in .env");
   process.exit(1);
@@ -85,9 +90,7 @@ if (!yahooFinance || typeof yahooFinance.quote !== "function" || typeof yahooFin
 
 const hasChart = yahooFinance && typeof yahooFinance.chart === "function";
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
 function normCdf(x) {
   const t = 1 / (1 + 0.2316419 * Math.abs(x));
@@ -192,35 +195,6 @@ function trendSupports(type, trendDir) {
   return type === "call" ? trendDir === "bull" : trendDir === "bear";
 }
 
-function formatAlertText(r) {
-  const kind = r.type === "call" ? "CALL" : "PUT";
-  const expStr = r.expDate.toISOString().slice(0,10);
-  const buyLine = r.buyIn > 0 ? `$${r.buyIn.toFixed(2)}` : "n/a";
-  const sellLine = r.buyIn > 0 ? `$${r.sellTarget.toFixed(2)}` : "n/a";
-  const deltaStr = Number.isFinite(r.delta) ? r.delta.toFixed(2) : "n/a";
-  const thetaStr = Number.isFinite(r.thetaPerDay) ? r.thetaPerDay.toFixed(4) : "n/a";
-  const ivStr = Number.isFinite(r.ivPct) ? `${r.ivPct.toFixed(1)}%` : "n/a";
-  const popStr = Number.isFinite(r.pop) ? `${(r.pop*100).toFixed(1)}%` : "n/a";
-  const costStr = r.approxCost > 0 ? `$${r.approxCost.toFixed(0)}` : "n/a";
-  const modeLine = r.isSmallAccount ? `Mode: Small-Account (≤ $${cfg.smallAccountMaxCost})\n` : "";
-
-  return [
-    "Not financial advice.",
-    "🔥 SUPER ALERT 🔥",
-    `${r.ticker} $${r.spot.toFixed(2)} • ${kind} • Strike $${r.strike}`,
-    `Exp: ${expStr} (DTE: ${r.dte})`,
-    `Type: BUY ${kind}`,
-    `Target buy-in: ${buyLine}`,
-    `Target sell: ${sellLine} (~30% target)`,
-    `Rating: ${r.rating.toFixed(1)}/10`,
-    `Delta: ${deltaStr}, Theta/day: ${thetaStr}, IV: ${ivStr}`,
-    `POP*: ${popStr}`,
-    modeLine.trimEnd(),
-    `Approx cost: ${costStr} per contract`,
-    "Not financial advice."
-  ].filter(Boolean).join("\n");
-}
-
 function buildAlertEmbed(r) {
   const kind = r.type === "call" ? "CALL" : "PUT";
   const expStr = r.expDate.toISOString().slice(0,10);
@@ -233,15 +207,21 @@ function buildAlertEmbed(r) {
   const popStr = Number.isFinite(r.pop) ? `${(r.pop*100).toFixed(1)}%` : "n/a";
   const costStr = r.approxCost > 0 ? `$${r.approxCost.toFixed(0)}` : "n/a";
 
+  let stopLossText = "—";
+  if (cfg.stopLossEnabled && Number.isFinite(cfg.stopLossPct) && cfg.stopLossPct > 0 && r.buyIn > 0) {
+    const sl = r.buyIn * (1 - (cfg.stopLossPct / 100));
+    stopLossText = `$${sl.toFixed(2)}  (-${cfg.stopLossPct}%)`;
+  }
+
   const embed = new EmbedBuilder()
     .setTitle("🔥 SUPER ALERT")
     .setDescription(`**${r.ticker}** $${r.spot.toFixed(2)} • **${kind}** • Strike **$${r.strike}**\nExp: **${expStr}** (DTE: **${r.dte}**)`)
     .addFields(
-      { name: "Trade", value: `Type: **BUY ${kind}**\nBuy-in: **${buyLine}**\nSell target: **${sellLine}** (~30%)`, inline: true },
+      { name: "Trade", value: `Type: **BUY ${kind}**\nBuy-in: **${buyLine}**\nSell target: **${sellLine}** (~30%)\nStop-loss*: **${stopLossText}**`, inline: true },
       { name: "Score", value: `Rating: **${r.rating.toFixed(1)}/10**\nPOP*: **${popStr}**\nCost: **${costStr}** / contract`, inline: true },
       { name: "Greeks", value: `Delta: **${deltaStr}**\nTheta/day: **${thetaStr}**\nIV: **${ivStr}**`, inline: true },
     )
-    .setFooter({ text: "Not financial advice." });
+    .setFooter({ text: "Not financial advice. Stop-loss is a configurable helper value." });
 
   if (r.isSmallAccount) {
     embed.addFields({ name: "Mode", value: `Small-Account (≤ $${cfg.smallAccountMaxCost})`, inline: true });
@@ -339,7 +319,7 @@ async function postAlerts(allResults) {
     channel = await client.channels.fetch(targetChannelId);
   } catch (e) {
     console.error("Missing Access to CHANNEL_ID (or VIP_CHANNEL_ID).");
-    console.error("Bot must be in the server and have View Channel + Send Messages.");
+    console.error("Bot must be in the server and have View Channel + Send Messages + Embed Links.");
     throw e;
   }
 
@@ -351,14 +331,8 @@ async function postAlerts(allResults) {
     if (seen.has(key)) continue;
 
     const prefix = (cfg.tagVipRole && cfg.vipRoleId) ? `<@&${cfg.vipRoleId}>` : "";
-    if (cfg.useEmbeds) {
-      const embed = buildAlertEmbed(r);
-      await channel.send({ content: prefix || undefined, embeds: [embed] });
-    } else {
-      const text = formatAlertText(r);
-      const content = (prefix ? prefix + "\n" : "") + "```\n" + text + "\n```";
-      await channel.send(content);
-    }
+    const embed = buildAlertEmbed(r);
+    await channel.send({ content: prefix || undefined, embeds: [embed] });
 
     seen.set(key, Date.now());
     posted += 1;
