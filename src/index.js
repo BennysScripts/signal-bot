@@ -1,19 +1,18 @@
-import { Client, GatewayIntentBits, EmbedBuilder, Events } from "discord.js";
+import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
 import dotenv from "dotenv";
 import YahooFinanceImport from "yahoo-finance2";
 import fs from "fs";
 import path from "path";
+import dns from "node:dns";
 
 dotenv.config();
-console.log("Node version:", process.version);
+
+try { dns.setDefaultResultOrder("ipv4first"); } catch {}
 
 function createYahooClient(mod) {
   const YahooFinance = mod?.default ?? mod;
-
-  // Some versions export an object with methods (quote/options/chart)
   if (YahooFinance && typeof YahooFinance === "object") return YahooFinance;
 
-  // Some versions export a class/function constructor
   if (typeof YahooFinance === "function") {
     const proto = YahooFinance.prototype || {};
     const hasProtoMethods =
@@ -22,27 +21,18 @@ function createYahooClient(mod) {
       typeof proto.chart === "function";
 
     if (hasProtoMethods) {
-      try {
-        return new YahooFinance({ suppressNotices: ["yahooSurvey"] });
-      } catch {}
-      try {
-        return new YahooFinance();
-      } catch {}
+      try { return new YahooFinance({ suppressNotices: ["yahooSurvey"] }); } catch {}
+      try { return new YahooFinance(); } catch {}
     }
 
-    // Some versions export a callable with static methods
     const hasDirectMethods =
       typeof YahooFinance.quote === "function" ||
       typeof YahooFinance.options === "function" ||
       typeof YahooFinance.chart === "function";
 
     if (hasDirectMethods) return YahooFinance;
-
-    try {
-      return new YahooFinance();
-    } catch {}
+    try { return new YahooFinance(); } catch {}
   }
-
   return null;
 }
 
@@ -51,25 +41,18 @@ const yahooFinance = createYahooClient(YahooFinanceImport);
 const cfg = {
   token: process.env.DISCORD_TOKEN,
   channelId: process.env.CHANNEL_ID,
-
-  tickers: (process.env.TICKERS || "AAPL,TSLA")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
-
+  tickers: (process.env.TICKERS || "AAPL,TSLA").split(",").map(s => s.trim()).filter(Boolean),
   scanIntervalMinutes: Number(process.env.SCAN_INTERVAL_MINUTES || 15),
   maxAlertsPerScan: Number(process.env.MAX_ALERTS_PER_SCAN || 6),
 
   useEmbeds: (process.env.USE_EMBEDS ?? "true").toLowerCase() === "true",
 
-  // Stop-loss helper (display only)
   stopLossEnabled: (process.env.STOP_LOSS_ENABLED ?? "false").toLowerCase() === "true",
   stopLossPct: Number(process.env.STOP_LOSS_PCT || 25),
 
   includeCalls: (process.env.INCLUDE_CALLS ?? "true").toLowerCase() === "true",
   includePuts: (process.env.INCLUDE_PUTS ?? "true").toLowerCase() === "true",
 
-  // Trend filter (optional; uses Yahoo chart endpoint)
   useTrendFilter: (process.env.USE_TREND_FILTER ?? "false").toLowerCase() === "true",
 
   dteMin: Number(process.env.DTE_MIN || 3),
@@ -81,8 +64,8 @@ const cfg = {
   minOpenInterest: Number(process.env.MIN_OPEN_INTEREST || 200),
   maxIvPct: Number(process.env.MAX_IV_PCT || 60),
 
-  minAbsDelta: Number(process.env.MIN_ABS_DELTA || 0.3),
-  maxAbsDelta: Number(process.env.MAX_ABS_DELTA || 0.8),
+  minAbsDelta: Number(process.env.MIN_ABS_DELTA || 0.30),
+  maxAbsDelta: Number(process.env.MAX_ABS_DELTA || 0.80),
 
   riskFreeRate: Number(process.env.RISK_FREE_RATE || 0.02),
 
@@ -95,12 +78,10 @@ const cfg = {
   tagVipRole: (process.env.TAG_VIP_ROLE ?? "false").toLowerCase() === "true",
 };
 
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
-}
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
 if (!cfg.token || !cfg.channelId) {
-  console.error("Missing DISCORD_TOKEN or CHANNEL_ID in environment variables.");
+  console.error("Missing DISCORD_TOKEN or CHANNEL_ID in .env");
   process.exit(1);
 }
 
@@ -110,32 +91,57 @@ if (!yahooFinance || typeof yahooFinance.quote !== "function" || typeof yahooFin
   process.exit(1);
 }
 
-const hasChart = typeof yahooFinance.chart === "function";
+const hasChart = yahooFinance && typeof yahooFinance.chart === "function";
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
+const YF_RETRIES = Number(process.env.YF_RETRIES || 3);
+const YF_RETRY_DELAY_MS = Number(process.env.YF_RETRY_DELAY_MS || 800);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function isRetryableYahooError(e) {
+  const code = e?.cause?.code || e?.code;
+  const msg = String(e?.cause?.message || e?.message || "").toLowerCase();
+  return (
+    ["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN", "ENOTFOUND", "ENETUNREACH", "ECONNREFUSED"].includes(code) ||
+    msg.includes("fetch failed") ||
+    msg.includes("timeout") ||
+    msg.includes("getcrumb") ||
+    msg.includes("connect")
+  );
+}
+
+async function withRetry(fn, label = "yahoo") {
+  let lastErr;
+  for (let i = 0; i <= YF_RETRIES; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const retryable = i < YF_RETRIES && isRetryableYahooError(e);
+      const code = e?.cause?.code || e?.code || "";
+      console.log(`[${label}] error${code ? ` (${code})` : ""}:`, e?.message || e);
+      if (e?.cause) console.log(`[${label}] cause:`, e.cause);
+      if (!retryable) throw e;
+
+      const wait = YF_RETRY_DELAY_MS * Math.pow(2, i) + Math.floor(Math.random() * 250);
+      console.log(`[${label}] retry ${i + 1}/${YF_RETRIES} in ${wait}ms`);
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
 
 function normCdf(x) {
   const t = 1 / (1 + 0.2316419 * Math.abs(x));
-  const d = 0.3989423 * Math.exp(-(x * x) / 2);
-  let prob =
-    d *
-    t *
-    (0.3193815 +
-      t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  const d = 0.3989423 * Math.exp(-x * x / 2);
+  let prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   prob = 1 - prob;
   return x < 0 ? 1 - prob : prob;
 }
-function normPdf(x) {
-  return (1 / Math.sqrt(2 * Math.PI)) * Math.exp(-0.5 * x * x);
-}
+function normPdf(x) { return (1 / Math.sqrt(2 * Math.PI)) * Math.exp(-0.5 * x * x); }
 
 function bsGreeks({ S, K, T, r, sigma, type }) {
   if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return { delta: 0, thetaPerDay: 0, popITM: 0.5 };
-
   const sqrtT = Math.sqrt(T);
   const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
   const d2 = d1 - sigma * sqrtT;
@@ -151,7 +157,6 @@ function bsGreeks({ S, K, T, r, sigma, type }) {
     delta = Nd1 - 1;
     theta = -(S * normPdf(d1) * sigma) / (2 * sqrtT) + r * K * Math.exp(-r * T) * normCdf(-d2);
   }
-
   const thetaPerDay = theta / 365;
   const popITM = type === "call" ? Nd2 : normCdf(-d2);
   return { delta, thetaPerDay, popITM };
@@ -163,16 +168,10 @@ function parseExpiration(exp) {
   if (exp instanceof Date) return exp;
   return new Date(String(exp));
 }
-
-function daysTo(expDate) {
-  return Math.ceil((expDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
-}
+function daysTo(expDate) { return Math.ceil((expDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)); }
 
 function pickMidPrice(c) {
-  const bid = Number(c.bid);
-  const ask = Number(c.ask);
-  const last = Number(c.lastPrice);
-
+  const bid = Number(c.bid), ask = Number(c.ask), last = Number(c.lastPrice);
   if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) return (bid + ask) / 2;
   if (Number.isFinite(last) && last > 0) return last;
   if (Number.isFinite(ask) && ask > 0) return ask;
@@ -192,54 +191,31 @@ function scoreContract({ absDelta, ivPct, volume, openInterest, trendOk }) {
 
 const CACHE_FILE = path.join(process.cwd(), ".dedupe-cache.json");
 let seen = new Map();
-
-function loadCache() {
-  try {
-    const raw = fs.readFileSync(CACHE_FILE, "utf8");
-    seen = new Map(JSON.parse(raw));
-  } catch {}
-}
-
-function saveCache() {
-  try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify([...seen.entries()]), "utf8");
-  } catch {}
-}
-
-function pruneCache(hours = 12) {
+function loadCache() { try { seen = new Map(JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"))); } catch {} }
+function saveCache() { try { fs.writeFileSync(CACHE_FILE, JSON.stringify([...seen.entries()]), "utf8"); } catch {} }
+function pruneCache(hours=12) {
   const cutoff = Date.now() - hours * 60 * 60 * 1000;
-  for (const [k, ts] of seen.entries()) {
-    if (ts < cutoff) seen.delete(k);
-  }
+  for (const [k, ts] of seen.entries()) if (ts < cutoff) seen.delete(k);
 }
 
 const trendCache = new Map();
-
 async function getTrend(ticker) {
   if (!cfg.useTrendFilter || !hasChart) return "flat";
 
   const cached = trendCache.get(ticker);
-  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached.direction;
+  if (cached && (Date.now() - cached.ts) < 10 * 60 * 1000) return cached.direction;
 
   const nowSec = Math.floor(Date.now() / 1000);
   const period2 = nowSec;
-  const period1 = nowSec - 90 * 24 * 60 * 60; // ~3 months
+  const period1 = nowSec - (90 * 24 * 60 * 60); // ~3 months
 
   try {
-    const chart = await yahooFinance.chart(ticker, { period1, period2, interval: "1d" });
-    const closes = (chart?.quotes || [])
-      .map((q) => q.close)
-      .filter((n) => Number.isFinite(n));
+    const chart = await withRetry(() => yahooFinance.chart(ticker, { period1, period2, interval: "1d" }), `chart ${ticker}`);
+    const closes = (chart?.quotes || []).map(q => q.close).filter(n => Number.isFinite(n));
+    if (closes.length < 55) { trendCache.set(ticker, { ts: Date.now(), direction: "flat" }); return "flat"; }
 
-    if (closes.length < 55) {
-      trendCache.set(ticker, { ts: Date.now(), direction: "flat" });
-      return "flat";
-    }
-
-    const sma = (arr, n) => arr.slice(-n).reduce((a, b) => a + b, 0) / n;
-    const sma20 = sma(closes, 20);
-    const sma50 = sma(closes, 50);
-    const last = closes[closes.length - 1];
+    const sma = (arr, n) => arr.slice(-n).reduce((a,b)=>a+b,0)/n;
+    const sma20 = sma(closes, 20), sma50 = sma(closes, 50), last = closes[closes.length - 1];
 
     let direction = "flat";
     if (sma20 > sma50 && last >= sma20) direction = "bull";
@@ -260,53 +236,34 @@ function trendSupports(type, trendDir) {
 
 function buildAlertEmbed(r) {
   const kind = r.type === "call" ? "CALL" : "PUT";
-  const expStr = r.expDate.toISOString().slice(0, 10);
-
+  const expStr = r.expDate.toISOString().slice(0,10);
   const buyLine = r.buyIn > 0 ? `$${r.buyIn.toFixed(2)}` : "n/a";
   const sellLine = r.buyIn > 0 ? `$${r.sellTarget.toFixed(2)}` : "n/a";
 
   const deltaStr = Number.isFinite(r.delta) ? r.delta.toFixed(2) : "n/a";
   const thetaStr = Number.isFinite(r.thetaPerDay) ? r.thetaPerDay.toFixed(4) : "n/a";
   const ivStr = Number.isFinite(r.ivPct) ? `${r.ivPct.toFixed(1)}%` : "n/a";
-  const popStr = Number.isFinite(r.pop) ? `${(r.pop * 100).toFixed(1)}%` : "n/a";
+  const popStr = Number.isFinite(r.pop) ? `${(r.pop*100).toFixed(1)}%` : "n/a";
   const costStr = r.approxCost > 0 ? `$${r.approxCost.toFixed(0)}` : "n/a";
 
   let stopLossText = "—";
   if (cfg.stopLossEnabled && Number.isFinite(cfg.stopLossPct) && cfg.stopLossPct > 0 && r.buyIn > 0) {
-    const sl = r.buyIn * (1 - cfg.stopLossPct / 100);
-    stopLossText = `$${sl.toFixed(2)} (-${cfg.stopLossPct}%)`;
+    const sl = r.buyIn * (1 - (cfg.stopLossPct / 100));
+    stopLossText = `$${sl.toFixed(2)}  (-${cfg.stopLossPct}%)`;
   }
 
   const embed = new EmbedBuilder()
     .setTitle("🔥 SUPER ALERT")
-    .setDescription(
-      `**${r.ticker}** $${r.spot.toFixed(2)} • **${kind}** • Strike **$${r.strike}**\nExp: **${expStr}** (DTE: **${r.dte}**)`
-    )
+    .setDescription(`**${r.ticker}** $${r.spot.toFixed(2)} • **${kind}** • Strike **$${r.strike}**\nExp: **${expStr}** (DTE: **${r.dte}**)`)
     .addFields(
-      {
-        name: "Trade",
-        value: `Type: **BUY ${kind}**\nBuy-in: **${buyLine}**\nSell target: **${sellLine}** (~30%)\nStop-loss*: **${stopLossText}**`,
-        inline: true,
-      },
-      {
-        name: "Score",
-        value: `Rating: **${r.rating.toFixed(1)}/10**\nPOP*: **${popStr}**\nCost: **${costStr}** / contract`,
-        inline: true,
-      },
-      {
-        name: "Greeks",
-        value: `Delta: **${deltaStr}**\nTheta/day: **${thetaStr}**\nIV: **${ivStr}**`,
-        inline: true,
-      }
+      { name: "Trade", value: `Type: **BUY ${kind}**\nBuy-in: **${buyLine}**\nSell target: **${sellLine}** (~30%)\nStop-loss*: **${stopLossText}**`, inline: true },
+      { name: "Score", value: `Rating: **${r.rating.toFixed(1)}/10**\nPOP*: **${popStr}**\nCost: **${costStr}** / contract`, inline: true },
+      { name: "Greeks", value: `Delta: **${deltaStr}**\nTheta/day: **${thetaStr}**\nIV: **${ivStr}**`, inline: true },
     )
     .setFooter({ text: "Not financial advice. Stop-loss is a configurable helper value." });
 
   if (r.isSmallAccount) {
-    embed.addFields({
-      name: "Mode",
-      value: `Small-Account (≤ $${cfg.smallAccountMaxCost})`,
-      inline: true,
-    });
+    embed.addFields({ name: "Mode", value: `Small-Account (≤ $${cfg.smallAccountMaxCost})`, inline: true });
   }
 
   return embed;
@@ -316,12 +273,12 @@ async function scanTicker(ticker) {
   const results = [];
   const trendDir = await getTrend(ticker);
 
-  const quote = await yahooFinance.quote(ticker);
+  const quote = await withRetry(() => yahooFinance.quote(ticker), `quote ${ticker}`);
   const spot = Number(quote?.regularMarketPrice);
   if (!Number.isFinite(spot) || spot <= 0) return results;
 
-  const options = await yahooFinance.options(ticker);
-  const expiries = (options?.options || []).map((o) => ({
+  const options = await withRetry(() => yahooFinance.options(ticker), `options ${ticker}`);
+  const expiries = (options?.options || []).map(o => ({
     expDate: parseExpiration(o.expirationDate),
     calls: o.calls || [],
     puts: o.puts || [],
@@ -336,7 +293,7 @@ async function scanTicker(ticker) {
     const near = (c) => {
       const strike = Number(c.strike);
       if (!Number.isFinite(strike) || strike <= 0) return false;
-      return Math.abs(strike - spot) / spot <= cfg.strikeDistancePct;
+      return (Math.abs(strike - spot) / spot) <= cfg.strikeDistancePct;
     };
 
     const candidates = [];
@@ -372,46 +329,29 @@ async function scanTicker(ticker) {
       const isSmallAccount = approxCost <= cfg.smallAccountMaxCost;
       if (cfg.smallAccountOnly && !isSmallAccount) continue;
 
-      const rating = scoreContract({
-        absDelta,
-        ivPct: Number.isFinite(ivPct) ? ivPct : 999,
-        volume,
-        openInterest,
-        trendOk: true,
-      });
-
+      const rating = scoreContract({ absDelta, ivPct: ivPct || 999, volume, openInterest, trendOk: true });
       const sellTarget = buyIn * 1.3;
 
       results.push({
         ticker: ticker.toUpperCase(),
-        spot,
-        type: c._type,
-        strike: K,
-        expDate: ex.expDate,
-        dte,
-        buyIn,
-        sellTarget,
-        rating,
-        delta: greeks.delta,
-        thetaPerDay: greeks.thetaPerDay,
-        ivPct,
-        pop: greeks.popITM,
-        approxCost,
-        isSmallAccount,
+        spot, type: c._type, strike: K,
+        expDate: ex.expDate, dte,
+        buyIn, sellTarget, rating,
+        delta: greeks.delta, thetaPerDay: greeks.thetaPerDay,
+        ivPct, pop: greeks.popITM,
+        approxCost, isSmallAccount,
       });
     }
   }
 
-  results.sort((a, b) => (b.rating - a.rating) || (a.approxCost - b.approxCost));
+  results.sort((a,b) => (b.rating - a.rating) || (a.approxCost - b.approxCost));
   return results;
 }
 
-function makeKey(r) {
-  return `${r.ticker}|${r.type}|${r.strike}|${r.expDate.toISOString().slice(0, 10)}`;
-}
+function makeKey(r) { return `${r.ticker}|${r.type}|${r.strike}|${r.expDate.toISOString().slice(0,10)}`; }
 
 async function postAlerts(allResults) {
-  const targetChannelId = cfg.vipOnly && cfg.vipChannelId ? cfg.vipChannelId : cfg.channelId;
+  const targetChannelId = (cfg.vipOnly && cfg.vipChannelId) ? cfg.vipChannelId : cfg.channelId;
 
   let channel;
   try {
@@ -423,21 +363,18 @@ async function postAlerts(allResults) {
   }
 
   let posted = 0;
-
   for (const r of allResults) {
     if (posted >= cfg.maxAlertsPerScan) break;
 
     const key = makeKey(r);
     if (seen.has(key)) continue;
 
-    const prefix = cfg.tagVipRole && cfg.vipRoleId ? `<@&${cfg.vipRoleId}>` : "";
+    const prefix = (cfg.tagVipRole && cfg.vipRoleId) ? `<@&${cfg.vipRoleId}>` : "";
     const embed = buildAlertEmbed(r);
-
     await channel.send({ content: prefix || undefined, embeds: [embed] });
 
     seen.set(key, Date.now());
     posted += 1;
-
     await sleep(900);
   }
 
@@ -454,16 +391,15 @@ async function scanOnce() {
     if (!ticker) continue;
 
     try {
-      bucket.push(...(await scanTicker(ticker)));
+      bucket.push(...await scanTicker(ticker));
     } catch (e) {
-      console.log(`Scan error for ${ticker}:`, e);
-      console.log("Cause:", e?.cause);
+      console.log(`Scan error for ${ticker}:`, e?.message || e);
+      if (e?.cause) console.log("Cause:", e.cause);
     }
-
     await sleep(650);
   }
 
-  bucket.sort((a, b) => (b.rating - a.rating) || (a.approxCost - b.approxCost));
+  bucket.sort((a,b) => (b.rating - a.rating) || (a.approxCost - b.approxCost));
 
   try {
     const posted = await postAlerts(bucket);
@@ -473,7 +409,11 @@ async function scanOnce() {
   }
 }
 
-client.once(Events.ClientReady, async () => {
+let _didReady = false;
+async function _onReady() {
+  if (_didReady) return;
+  _didReady = true;
+
   console.log(`Logged in as ${client.user.tag}`);
   loadCache();
 
@@ -481,10 +421,9 @@ client.once(Events.ClientReady, async () => {
 
   const ms = Math.max(1, cfg.scanIntervalMinutes) * 60 * 1000;
   setInterval(scanOnce, ms);
-});
+}
 
-console.log("About to login to Discord...");
-client.login(cfg.token).catch((err) => {
-  console.error("Login failed:", err);
-  process.exit(1);
-});
+client.once("clientReady", _onReady);
+client.once("ready", _onReady);
+
+client.login(cfg.token);
